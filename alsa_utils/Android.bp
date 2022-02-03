@@ -40,3 +40,33 @@ cc_library_shared {
         "-Wno-unused-parameter",
     ],
 }
+
+cc_library_shared {
+    name: "libalsautils_sec",
+    vendor: true,
+    srcs: [
+        "alsa_device_profile.c",
+        "alsa_device_proxy.c",
+        "alsa_logging.c",
+        "alsa_format.c",
+    ],
+    export_include_dirs: ["include"],
+    header_libs: [
+        "libaudio_system_headers",
+    ],
+    export_header_lib_headers: [
+        "libaudio_system_headers",
+    ],
+    shared_libs: [
+        "liblog",
+        "libcutils",
+        "libtinyalsa_sec",
+        "libaudioutils",
+    ],
+    cflags: [
+        "-Werror",
+        "-Wall",
+        "-Wno-unused-parameter",
+        "-D__ANDROID_VNDK_SEC__",
+    ],
+}

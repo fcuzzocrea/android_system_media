@@ -21,6 +21,29 @@
 extern "C" {
 #endif
 
+#ifdef __ANDROID_VNDK_SEC__
+enum pcm_dai_link {
+    PLAYBACK_LINK,
+    PLAYBACK_LOW_LINK,
+    PLAYBACK_DEEP_LINK,
+    PLAYBACK_OFFLOAD_LINK,
+    PLAYBACK_AUX_DIGITAL_LINK,
+    PLAYBACK_DIRECT_LINK,
+    PLAYBACK_INCALL_MUSIC_LINK,
+    CAPTURE_LINK,
+    BASEBAND_LINK,
+    BASEBAND_CAPTURE_LINK,
+    BLUETOOTH_LINK,
+    BLUETOOTH_CAPTURE_LINK,
+    VTS_CAPTURE_LINK,
+    VTS_SEAMLESS_CATURE_LINK,
+    CALL_REC_CAPTURE_LINK,
+    FMRADIO_LINK,
+    CAPTURE_CALLMIC_LINK,
+    NUM_DAI_LINK,
+};
+#endif
+
 /* Initialize and free the audio routes */
 struct audio_route *audio_route_init(unsigned int card, const char *xml_path);
 void audio_route_free(struct audio_route *ar);
@@ -42,6 +65,14 @@ void audio_route_reset(struct audio_route *ar);
 
 /* Update the mixer with any changed values */
 int audio_route_update_mixer(struct audio_route *ar);
+
+#ifdef __ANDROID_VNDK_SEC__
+/* Get pcm-dai information */
+int get_dai_link(struct audio_route *ar, enum pcm_dai_link dai_link);
+
+/* return number of missing control */
+int audio_route_missing_ctl(struct audio_route *ar);
+#endif
 
 #if defined(__cplusplus)
 }  /* extern "C" */

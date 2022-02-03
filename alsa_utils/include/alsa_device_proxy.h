@@ -47,8 +47,11 @@ int proxy_get_capture_position(const alsa_device_proxy * proxy,
 unsigned proxy_get_sample_rate(const alsa_device_proxy * proxy);
 enum pcm_format proxy_get_format(const alsa_device_proxy * proxy);
 unsigned proxy_get_channel_count(const alsa_device_proxy * proxy);
-unsigned int proxy_get_period_size(const alsa_device_proxy * proxy);
 unsigned proxy_get_latency(const alsa_device_proxy * proxy);
+unsigned int proxy_get_period_size(const alsa_device_proxy * proxy);
+#ifdef __ANDROID_VNDK_SEC__
+unsigned int proxy_get_period_count(const alsa_device_proxy * proxy);
+#endif
 
 /*
  * Scans the provided list of sample rates and finds the first one that works.
@@ -61,6 +64,11 @@ int proxy_scan_rates(alsa_device_proxy * proxy, const unsigned sample_rates[]);
 /* I/O */
 int proxy_write(alsa_device_proxy * proxy, const void *data, unsigned int count);
 int proxy_read(alsa_device_proxy * proxy, void *data, unsigned int count);
+
+#ifdef __ANDROID_VNDK_SEC__
+int proxy_start(const alsa_device_proxy * proxy);
+int proxy_stop(const alsa_device_proxy * proxy);
+#endif
 
 /* Debugging */
 void proxy_dump(const alsa_device_proxy * proxy, int fd);
