@@ -16,7 +16,7 @@
  */
 
 #define LOG_TAG "audio_route"
-/*#define LOG_NDEBUG 0*/
+#define LOG_NDEBUG 0
 
 #include <errno.h>
 #include <expat.h>
@@ -27,6 +27,10 @@
 #include <log/log.h>
 
 #include <tinyalsa/asoundlib.h>
+
+#ifdef __ANDROID_VNDK_SEC__
+#include "include/audio_route/audio_route.h"
+#endif
 
 #define BUF_SIZE 1024
 #define MIXER_XML_PATH "/system/etc/mixer_paths.xml"
@@ -81,6 +85,14 @@ struct mixer_path {
     struct mixer_setting *setting;
 };
 
+#ifdef __ANDROID_VNDK_SEC__
+struct path_list {
+    const struct mixer_path **paths;
+    unsigned int size;
+    unsigned int length;
+};
+#endif
+
 struct audio_route {
     struct mixer *mixer;
     unsigned int num_mixer_ctls;
@@ -89,6 +101,13 @@ struct audio_route {
     unsigned int mixer_path_size;
     unsigned int num_mixer_paths;
     struct mixer_path *mixer_path;
+#ifdef __ANDROID_VNDK_SEC__
+    struct path_list mixer_path_index;
+    struct path_list applied_path;
+    struct path_list reset_path;
+    bool update_by_path;
+    int32_t missing;
+#endif
 };
 
 struct config_parse_state {
@@ -96,6 +115,84 @@ struct config_parse_state {
     struct mixer_path *path;
     int level;
 };
+
+#ifdef __ANDROID_VNDK_SEC__
+static bool mixer_path_index_ready(struct audio_route *ar)
+{
+    return (ar->mixer_path_index.length > 0);
+}
+
+static const struct mixer_path *mixer_path_index_find(struct audio_route *ar, const char *name)
+{
+    struct path_list *index = &ar->mixer_path_index;
+    int s, e, m, compare;
+
+    if (!mixer_path_index_ready(ar))
+        return NULL;
+
+    s = 0;
+    e = index->length - 1;
+    while (s <= e) {
+        m = (s + e) / 2;
+        compare = strcmp(index->paths[m]->name, name);
+        if (compare == 0)
+            return index->paths[m];
+        else if (compare < 0)
+            s = m + 1;
+        else
+            e = m - 1;
+    }
+
+    return NULL;
+}
+
+static int path_list_add(struct path_list *list, const struct mixer_path *path);
+static void path_list_free(struct path_list *list);
+
+static int mixer_path_index_add(struct audio_route *ar, const struct mixer_path *path)
+{
+    struct path_list *index = &ar->mixer_path_index;
+    int i, ret;
+
+    ret = path_list_add(index, path);
+    if (ret < 0)
+        return ret;
+
+    for (i = index->length - 1; i > 0; --i) {
+        const struct mixer_path *temp;
+
+        if (strcmp(index->paths[i - 1]->name, index->paths[i]->name) <= 0)
+            break;
+
+        temp = index->paths[i - 1];
+        index->paths[i - 1] = index->paths[i];
+        index->paths[i] = temp;
+    }
+
+    return 0;
+}
+
+static int mixer_path_index_init(struct audio_route *ar)
+{
+    const struct mixer_path *path;
+    int ret;
+
+    ALOGV("%s", __func__);
+
+    for (path = ar->mixer_path; path - ar->mixer_path < ar->num_mixer_paths; path++) {
+        ret = mixer_path_index_add(ar, path);
+        if (ret < 0)
+            break;
+    }
+
+    return ret;
+}
+
+static void mixer_path_index_free(struct audio_route *ar)
+{
+    path_list_free(&ar->mixer_path_index);
+}
+#endif
 
 /* path functions */
 
@@ -190,6 +287,15 @@ static struct mixer_path *path_get_by_name(struct audio_route *ar,
 {
     unsigned int i;
 
+#ifdef __ANDROID_VNDK_SEC__
+    do {
+        struct mixer_path *path;
+
+        path = (struct mixer_path *)mixer_path_index_find(ar, name);
+        if (path)
+            return path;
+    } while (0);
+#endif
     for (i = 0; i < ar->num_mixer_paths; i++)
         if (strcmp(ar->mixer_path[i].name, name) == 0)
             return &ar->mixer_path[i];
@@ -399,6 +505,91 @@ static int path_add_path(struct audio_route *ar, struct mixer_path *path,
     return 0;
 }
 
+#ifdef __ANDROID_VNDK_SEC__
+static bool path_list_contains(const struct path_list *list, const struct mixer_path *path)
+{
+    const struct mixer_path * const * cur;
+
+    for (cur = list->paths; cur - list->paths < list->length; cur++) {
+        if (*cur == path)
+            return true;
+    }
+
+    return false;
+}
+
+static int path_list_add(struct path_list *list, const struct mixer_path *path)
+{
+    void *new_buffer;
+    unsigned int new_size;
+
+    if (path_list_contains(list, path))
+        return 0;
+
+    if (list->size <= list->length) {
+        new_size = list->size ? (list->size * 2) : 8;
+        new_buffer = realloc(list->paths, new_size * sizeof(list->paths[0]));
+        if (new_buffer == NULL) {
+            ALOGE("Unable to allocate more paths");
+            return -1;
+        }
+        list->paths = new_buffer;
+        list->size = new_size;
+    }
+    list->paths[list->length++] = path;
+    return 0;
+}
+
+static void path_list_clear(struct path_list *list)
+{
+    list->length = 0;
+}
+
+static void path_list_free(struct path_list *list)
+{
+    free(list->paths);
+}
+
+static void save_path_apply(struct audio_route *ar, const struct mixer_path *path, const struct mixer_setting *setting)
+{
+    struct mixer_state *ms = &ar->mixer_state[setting->ctl_index];
+    size_t value_sz = sizeof_ctl_type(mixer_ctl_get_type(ms->ctl));
+
+    if (!ar->update_by_path)
+        return;
+
+    if (ms->active_count > 0 && memcmp(ms->old_value.ptr, setting->value.ptr, setting->num_values * value_sz))
+        ALOGW("Multi-activated mixer control %s with path %s", mixer_ctl_get_name(ms->ctl), path->name);
+    ms->active_count++;
+    path_list_add(&ar->applied_path, path);
+}
+
+static void save_path_reset(struct audio_route *ar, const struct mixer_path *path, const struct mixer_setting *setting)
+{
+    struct mixer_state *ms = &ar->mixer_state[setting->ctl_index];
+
+    if (!ar->update_by_path)
+        return;
+
+    if (ms->active_count > 0)
+        ms->active_count--;
+    else
+        ALOGW("Deactivate inactive mixer control %s with path %s", mixer_ctl_get_name(ms->ctl), path->name);
+    path_list_add(&ar->reset_path, path);
+}
+
+static void free_path_lists(struct audio_route *ar)
+{
+    path_list_free(&ar->applied_path);
+    path_list_free(&ar->reset_path);
+}
+
+void audio_route_update_mixer_by_path(struct audio_route *ar, bool set)
+{
+    ar->update_by_path = set;
+}
+#endif
+
 static int path_apply(struct audio_route *ar, struct mixer_path *path)
 {
     unsigned int i;
@@ -414,6 +605,9 @@ static int path_apply(struct audio_route *ar, struct mixer_path *path)
         if (!is_supported_ctl_type(type))
             continue;
         size_t value_sz = sizeof_ctl_type(type);
+#ifdef __ANDROID_VNDK_SEC__
+        save_path_apply(ar, path, &path->setting[i]);
+#endif
         memcpy(ar->mixer_state[ctl_index].new_value.ptr, path->setting[i].value.ptr,
                    path->setting[i].num_values * value_sz);
     }
@@ -436,6 +630,9 @@ static int path_reset(struct audio_route *ar, struct mixer_path *path)
         if (!is_supported_ctl_type(type))
             continue;
         size_t value_sz = sizeof_ctl_type(type);
+#ifdef __ANDROID_VNDK_SEC__
+        save_path_reset(ar, path, &path->setting[i]);
+#endif
         /* reset the value(s) */
         memcpy(ar->mixer_state[ctl_index].new_value.ptr,
                ar->mixer_state[ctl_index].reset_value.ptr,
@@ -469,6 +666,68 @@ static int mixer_enum_string_to_value(struct mixer_ctl *ctl, const char *string)
     }
     return i;
 }
+
+#ifdef __ANDROID_VNDK_SEC__
+static void start_tag(void *data, const XML_Char *tag_name, const XML_Char **attr);
+static void end_tag(void *data, const XML_Char *tag_name);
+
+static int process_include_tag(const char *xml_path, struct audio_route *ar)
+{
+    struct config_parse_state state;
+    XML_Parser parser = NULL;
+    FILE *file = NULL;
+    void *buf;
+    int bytes_read;
+    int ret = 0;
+
+    file = fopen(xml_path, "r");
+    if (!file) {
+        ALOGE("Failed to open %s: %s", xml_path, strerror(errno));
+        ret = -1;
+        goto error;
+    }
+
+    parser = XML_ParserCreate(NULL);
+    if (!parser) {
+        ALOGE("Failed to create XML parser");
+        ret = -1;
+        goto error;
+    }
+
+    memset(&state, 0, sizeof(state));
+    state.ar = ar;
+    XML_SetUserData(parser, &state);
+    XML_SetElementHandler(parser, start_tag, end_tag);
+    do {
+        buf = XML_GetBuffer(parser, BUF_SIZE);
+        if (buf == NULL) {
+            ALOGE("Error in xml get buffer (%s)", xml_path);
+            ret = -1;
+            break;
+        }
+
+        bytes_read = fread(buf, 1, BUF_SIZE, file);
+        if (bytes_read < 0) {
+            ALOGE("Error in read xml file (%s)", xml_path);
+            ret = -1;
+            break;
+        }
+
+        if (XML_ParseBuffer(parser, bytes_read, bytes_read == 0) == XML_STATUS_ERROR) {
+            ALOGE("Error in mixer xml (%s)", xml_path);
+            ret = -1;
+            break;
+        }
+    } while (bytes_read > 0);
+
+error:
+    if (parser)
+        XML_ParserFree(parser);
+    if (file)
+        fclose(file);
+    return ret;
+}
+#endif
 
 static void start_tag(void *data, const XML_Char *tag_name,
                       const XML_Char **attr)
@@ -522,6 +781,9 @@ static void start_tag(void *data, const XML_Char *tag_name,
         ctl = mixer_get_ctl_by_name(ar->mixer, attr_name);
         if (ctl == NULL) {
             ALOGW("Control '%s' doesn't exist - skipping", attr_name);
+#ifdef __ANDROID_VNDK_SEC__
+            ar->missing++;
+#endif
             goto done;
         }
 
@@ -636,6 +898,11 @@ static void start_tag(void *data, const XML_Char *tag_name,
                 path_add_value(ar, state->path, &mixer_value);
         }
     }
+#ifdef __ANDROID_VNDK_SEC__
+    else if (strcmp(tag_name, "include") == 0) {
+        process_include_tag(attr_name, ar);
+    }
+#endif
 
 done:
     free(value_array);
@@ -658,6 +925,7 @@ static int alloc_mixer_state(struct audio_route *ar)
     enum mixer_ctl_type type;
 
     ar->num_mixer_ctls = mixer_get_num_ctls(ar->mixer);
+    ALOGD("Num Mixer Controls = %d", ar->num_mixer_ctls);
     ar->mixer_state = calloc(ar->num_mixer_ctls, sizeof(struct mixer_state));
     if (!ar->mixer_state)
         return -1;
@@ -718,6 +986,12 @@ int audio_route_update_mixer(struct audio_route *ar)
     unsigned int i;
     unsigned int j;
     struct mixer_ctl *ctl;
+    int ret = 0;
+
+#ifdef __ANDROID_VNDK_SEC__
+    if (ar->update_by_path)
+        return audio_route_update_mixer_path(ar);
+#endif
 
     for (i = 0; i < ar->num_mixer_ctls; i++) {
         unsigned int num_values = ar->mixer_state[i].num_values;
@@ -756,10 +1030,28 @@ int audio_route_update_mixer(struct audio_route *ar)
             }
         }
         if (changed) {
-            if (type == MIXER_CTL_TYPE_ENUM)
-                mixer_ctl_set_value(ctl, 0, ar->mixer_state[i].new_value.enumerated[0]);
-            else
+            if (type == MIXER_CTL_TYPE_ENUM) {
+                ret = mixer_ctl_set_value(ctl, 0, ar->mixer_state[i].new_value.enumerated[0]);
+                if (ret) {
+                    ALOGE("ctl(%d)   : Fail to set (%d) : \"%s\" value \"%s\"", i, ret,
+                        mixer_ctl_get_name(ctl),
+                        mixer_ctl_get_enum_string(ctl, ar->mixer_state[i].new_value.enumerated[0]));
+                } else {
+                    ALOGV("ctl(%d)   : \"%s\" value \"%s\"", i, mixer_ctl_get_name(ctl),
+                        mixer_ctl_get_enum_string(ctl, ar->mixer_state[i].new_value.enumerated[0]));
+                }
+            } else if (type == MIXER_CTL_TYPE_INT || type == MIXER_CTL_TYPE_BOOL) {
+                ret = mixer_ctl_set_array(ctl, ar->mixer_state[i].new_value.integer, num_values);
+                if (ret) {
+                    ALOGE("ctl(%d)   : Fail to set (%d) : \"%s\" value %ld", i, ret,
+                        mixer_ctl_get_name(ctl), ar->mixer_state[i].new_value.integer[0]);
+                } else {
+                    ALOGV("ctl(%d)   : \"%s\" value %ld", i, mixer_ctl_get_name(ctl),
+                        ar->mixer_state[i].new_value.integer[0]);
+                }
+            } else {
                 mixer_ctl_set_array(ctl, ar->mixer_state[i].new_value.ptr, num_values);
+            }
 
             size_t value_sz = sizeof_ctl_type(type);
             memcpy(ar->mixer_state[i].old_value.ptr, ar->mixer_state[i].new_value.ptr,
@@ -793,6 +1085,8 @@ void audio_route_reset(struct audio_route *ar)
     unsigned int i;
     enum mixer_ctl_type type;
 
+    ALOGI("> %s :", __FUNCTION__);
+
     /* load all of the saved values */
     for (i = 0; i < ar->num_mixer_ctls; i++) {
         type = mixer_ctl_get_type(ar->mixer_state[i].ctl);
@@ -809,6 +1103,8 @@ void audio_route_reset(struct audio_route *ar)
 int audio_route_apply_path(struct audio_route *ar, const char *name)
 {
     struct mixer_path *path;
+
+    ALOGI("> %s : \"%s\"", __FUNCTION__, name);
 
     if (!ar) {
         ALOGE("invalid audio_route");
@@ -855,8 +1151,11 @@ static int audio_route_update_path(struct audio_route *ar, const char *name, int
 {
     struct mixer_path *path;
     unsigned int j;
+    int ret = 0;
     bool reverse = direction != DIRECTION_FORWARD;
     bool force_reset = direction == DIRECTION_REVERSE_RESET;
+
+    ALOGI("> %s + : \"%s\" reverse(%d)", __FUNCTION__, name, reverse);
 
     if (!ar) {
         ALOGE("invalid audio_route");
@@ -869,6 +1168,7 @@ static int audio_route_update_path(struct audio_route *ar, const char *name, int
         return -1;
     }
 
+    ALOGI("> %s + : path length = %d", __FUNCTION__, path->length);
     for (size_t i = 0; i < path->length; ++i) {
         unsigned int ctl_index;
         enum mixer_ctl_type type;
@@ -918,7 +1218,15 @@ static int audio_route_update_path(struct audio_route *ar, const char *name, int
                             ms->num_values * value_sz);
                         break;
                     }
-                    mixer_ctl_set_value(ms->ctl, 0, ms->new_value.enumerated[0]);
+                    ret = mixer_ctl_set_value(ms->ctl, 0, ms->new_value.enumerated[0]);
+                    if (ret) {
+                        ALOGE("ctl(%zu)   : Fail to set (%d) : \"%s\" value \"%s\"", i, ret,
+                            mixer_ctl_get_name(ms->ctl),
+                            mixer_ctl_get_enum_string(ms->ctl, ms->new_value.enumerated[0]));
+                    } else {
+                        ALOGV("ctl(%zu)   : \"%s\" value \"%s\"", i, mixer_ctl_get_name(ms->ctl),
+                            mixer_ctl_get_enum_string(ms->ctl, ms->new_value.enumerated[0]));
+                    }
                     memcpy(ms->old_value.enumerated, ms->new_value.enumerated,
                             ms->num_values * value_sz);
                     break;
@@ -932,7 +1240,14 @@ static int audio_route_update_path(struct audio_route *ar, const char *name, int
                         ms->num_values * value_sz);
                     break;
                 }
-                mixer_ctl_set_array(ms->ctl, ms->new_value.integer, ms->num_values);
+                ret = mixer_ctl_set_array(ms->ctl, ms->new_value.integer, ms->num_values);
+                if (ret) {
+                        ALOGE("ctl(%zu)   : Fail to set (%d) : \"%s\" value %ld", i, ret,
+                            mixer_ctl_get_name(ms->ctl), ms->new_value.integer[0]);
+                } else {
+                        ALOGV("ctl(%zu)   : \"%s\" value %ld", i, mixer_ctl_get_name(ms->ctl),
+                            ms->new_value.integer[0]);
+                }
                 memcpy(ms->old_value.integer, ms->new_value.integer, ms->num_values * value_sz);
                 break;
             }
@@ -965,6 +1280,343 @@ int audio_route_force_reset_and_update_path(struct audio_route *ar, const char *
 
     return audio_route_update_path(ar, name, DIRECTION_REVERSE_RESET);
 }
+
+#ifdef __ANDROID_VNDK_SEC__
+static int activate_path(struct audio_route *ar, const char *name)
+{
+    struct mixer_path *path;
+    struct mixer_setting *setting;
+    struct mixer_state *ms;
+
+    path = path_get_by_name(ar, name);
+    if (!path) {
+        ALOGE("unable to find path '%s'", name);
+        return -1;
+    }
+
+    ALOGD("Activate path: %s", path->name);
+    for (setting = path->setting; setting - path->setting < path->length; setting++) {
+        ms = &ar->mixer_state[setting->ctl_index];
+        if (ms->active_count > 0 && memcmp(ms->new_value.ptr, setting->value.ptr, setting->num_values * sizeof_ctl_type(setting->type)))
+            ALOGW("Multi-activated mixer control %s with path %s", mixer_ctl_get_name(ms->ctl), path->name);
+        ms->active_count++;
+        memcpy(ms->new_value.ptr, setting->value.ptr, setting->num_values * sizeof_ctl_type(setting->type));
+    }
+
+    return 0;
+}
+
+static int deactivate_path(struct audio_route *ar, const char *name)
+{
+    struct mixer_path *path;
+    struct mixer_setting *setting;
+    struct mixer_state *ms;
+
+    path = path_get_by_name(ar, name);
+    if (!path) {
+        ALOGE("unable to find path '%s'", name);
+        return -1;
+    }
+
+    ALOGV("Deactivate path: %s", path->name);
+    for (setting = path->setting; setting - path->setting < path->length; setting++) {
+        ms = &ar->mixer_state[setting->ctl_index];
+        if (ms->active_count > 0)
+            ms->active_count--;
+        else
+            ALOGW("Deactivate inactive mixer control %s with path %s", mixer_ctl_get_name(ms->ctl), path->name);
+        memcpy(ms->new_value.ptr, ms->reset_value.ptr, ms->num_values * sizeof_ctl_type(setting->type));
+    }
+
+    return 0;
+}
+
+static bool mixer_state_is_changed(struct mixer_state *ms)
+{
+    size_t value_size = sizeof_ctl_type(mixer_ctl_get_type(ms->ctl));
+
+    return !!memcmp(ms->old_value.ptr, ms->new_value.ptr, ms->num_values * value_size);
+}
+
+
+static char *mixer_state_sprint_value(const struct mixer_state *ms, const union ctl_values *value, char *buffer, size_t size)
+{
+    enum mixer_ctl_type type = mixer_ctl_get_type(ms->ctl);
+    char *p = buffer;
+    int res, i;
+
+    switch (type) {
+    case MIXER_CTL_TYPE_BYTE:
+        res = snprintf(p, size, "%c", value->bytes[0]);
+        break;
+    case MIXER_CTL_TYPE_ENUM:
+        res = snprintf(p, size, "%s", mixer_ctl_get_enum_string(ms->ctl, value->enumerated[0]));
+        break;
+    default:
+        res = snprintf(p, size, "%ld", value->integer[0]);
+        break;
+    }
+    if (res < 0)
+        goto out;
+    size -= res;
+    p += res;
+
+    for (i = 1; i < ms->num_values; i++) {
+        if (size <= 2)
+            break;
+
+        switch (type) {
+        case MIXER_CTL_TYPE_BYTE:
+            res = snprintf(p, size, " %c", value->bytes[i]);
+            break;
+        case MIXER_CTL_TYPE_ENUM:
+            res = snprintf(p, size, ", %s", mixer_ctl_get_enum_string(ms->ctl, value->enumerated[i]));
+            break;
+        default:
+            res = snprintf(p, size, ", %ld", value->integer[i]);
+            break;
+        }
+        if (res < 0)
+            goto out;
+        size -= res;
+        p += res;
+    }
+out:
+    *p = '\0';
+    return buffer;
+}
+
+static char *mixer_state_sprint_new_value(const struct mixer_state *ms, char *buffer, size_t size)
+{
+    return mixer_state_sprint_value(ms, &ms->new_value, buffer, size);
+}
+
+static char *mixer_state_sprint_old_value(const struct mixer_state *ms, char *buffer, size_t size)
+{
+    return mixer_state_sprint_value(ms, &ms->old_value, buffer, size);
+}
+
+static int set_mixer_state_enum(struct mixer_state *ms)
+{
+    int ret = 0;
+
+    for (int i = 0; i < ms->num_values; i++) {
+        int res = mixer_ctl_set_value(ms->ctl, i, ms->new_value.enumerated[i]);
+        if (res < 0)
+            ret = res;
+    }
+
+    return ret;
+}
+
+static int set_mixer_state_integral(struct mixer_state *ms)
+{
+    return mixer_ctl_set_array(ms->ctl, ms->new_value.ptr, ms->num_values);
+}
+
+static int update_mixer_state(struct mixer_state *ms, bool reset)
+{
+    struct mixer_ctl *ctl = ms->ctl;
+    const char *name = mixer_ctl_get_name(ctl);
+    enum mixer_ctl_type type = mixer_ctl_get_type(ctl);
+    size_t value_size = sizeof_ctl_type(type);
+    int ret = 0;
+    char buffer[128];
+
+    if (!mixer_state_is_changed(ms)) {
+        ALOGV("ctl : Skip to set : \"%s\" value \"%s\"", name, mixer_state_sprint_new_value(ms, buffer, sizeof(buffer)));
+        return 0;
+    }
+
+    if (reset && ms->active_count > 0) {
+        ALOGV("ctl : Skip to reset : \"%s\" value \"%s\"", name, mixer_state_sprint_old_value(ms, buffer, sizeof(buffer)));
+        return 0;
+    }
+
+    switch (type) {
+    case MIXER_CTL_TYPE_ENUM:
+        ret = set_mixer_state_enum(ms);
+        break;
+    default:
+        ret = set_mixer_state_integral(ms);
+        break;
+    }
+
+    if (ret < 0)
+        ALOGE("ctl : Fail to set (%d) : \"%s\" value \"%s\"", ret, name, mixer_state_sprint_new_value(ms, buffer, sizeof(buffer)));
+    else
+        ALOGD("ctl : \"%s\" value \"%s\"", name, mixer_state_sprint_new_value(ms, buffer, sizeof(buffer)));
+
+    memcpy(ms->old_value.ptr, ms->new_value.ptr, ms->num_values * value_size);
+
+    return ret;
+}
+
+static int update_reset_path(struct audio_route *ar, const struct mixer_path *path)
+{
+    const struct mixer_setting *setting;
+    int res, ret = 0;
+
+    for (setting = path->setting + path->length - 1; setting - path->setting >= 0; setting--) {
+        res = update_mixer_state(&ar->mixer_state[setting->ctl_index], true);
+        if (res < 0)
+            ret = res;
+    }
+
+    return ret;
+}
+
+static int update_applied_path(struct audio_route *ar, const struct mixer_path *path)
+{
+    const struct mixer_setting *setting;
+    int res, ret = 0;
+
+    for (setting = path->setting; setting - path->setting < path->length; setting++) {
+        res = update_mixer_state(&ar->mixer_state[setting->ctl_index], false);
+        if (res < 0)
+            ret = res;
+    }
+
+    return ret;
+}
+
+/*
+ * Controls will be updated in the order listed in the XML file
+ */
+static int update_path(struct audio_route *ar, const char *name, bool reset)
+{
+    struct mixer_path *path;
+
+    path = path_get_by_name(ar, name);
+    if (!path) {
+        ALOGE("unable to find path '%s'", name);
+        return -1;
+    }
+
+    return reset ? update_reset_path(ar, path) : update_applied_path(ar, path);
+}
+
+int audio_route_exchange_and_update_path(struct audio_route *ar,
+        const char **reset_path, unsigned int reset_paths,
+        const char **apply_path, unsigned int apply_paths)
+{
+    const char **path_name;
+    int ret = 0;
+
+    if (!ar) {
+        ALOGE("invalid audio_route");
+        return -1;
+    }
+
+    /* reset path */
+    for (path_name = reset_path + reset_paths - 1; path_name - reset_path >= 0; path_name--)
+        deactivate_path(ar, *path_name);
+
+    /* apply path */
+    for (path_name = apply_path; path_name - apply_path < apply_paths; path_name++)
+        activate_path(ar, *path_name);
+
+    /* update reset path */
+    for (path_name = reset_path + reset_paths - 1; path_name - reset_path >= 0; path_name--)
+        update_path(ar, *path_name, true);
+
+    /* update applied path */
+    for (path_name = apply_path; path_name - apply_path < apply_paths; path_name++)
+        update_path(ar, *path_name, false);
+
+    return ret;
+}
+
+int audio_route_update_mixer_path(struct audio_route *ar)
+{
+    const struct mixer_path * const *path;
+
+    if (!ar) {
+        ALOGE("invalid audio_route");
+        return -1;
+    }
+
+    if (!ar->update_by_path) {
+        ALOGE("update mixer by path isn't enabled");
+        return -1;
+    }
+
+    /* update reset path */
+    for (path = ar->reset_path.paths + ar->reset_path.length - 1; path - ar->reset_path.paths >= 0; path--)
+        update_reset_path(ar, *path);
+    path_list_clear(&ar->reset_path);
+
+    /* update applied path */
+    for (path = ar->applied_path.paths; path - ar->applied_path.paths < ar->applied_path.length; path++)
+        update_applied_path(ar, *path);
+    path_list_clear(&ar->applied_path);
+
+    return 0;
+}
+
+static int path_apply_value(struct audio_route *ar, const struct mixer_path *path, long value)
+{
+    unsigned int i, j;
+    unsigned int ctl_index;
+    struct mixer_ctl *ctl;
+    enum mixer_ctl_type type;
+
+    ALOGD("Apply path Value: %s Value: %ld", path->name != NULL ? path->name : "none", value);
+    for (i = 0; i < path->length; i++) {
+        ctl_index = path->setting[i].ctl_index;
+        ctl = index_to_ctl(ar, ctl_index);
+        type = mixer_ctl_get_type(ctl);
+        if (!is_supported_ctl_type(type))
+            continue;
+        save_path_apply(ar, path, &path->setting[i]);
+        for (j = 0; j < ar->mixer_state[ctl_index].num_values; j++) {
+            if (type == MIXER_CTL_TYPE_BYTE)
+                ar->mixer_state[ctl_index].new_value.bytes[j] = value;
+            else if (type == MIXER_CTL_TYPE_INT)
+                ar->mixer_state[ctl_index].new_value.integer[j] = value;
+            else if (type == MIXER_CTL_TYPE_ENUM)
+                ar->mixer_state[ctl_index].new_value.enumerated[j] = value;
+            else
+                ar->mixer_state[ctl_index].new_value.integer[j] = value;
+        }
+    }
+
+    return 0;
+}
+
+/* Apply an audio route path (should contain only single control) by name & set the value */
+int audio_route_apply_path_value(struct audio_route *ar, const char *name, long value)
+{
+    const struct mixer_path *path;
+
+    ALOGI("> %s : \"%s\"", __FUNCTION__, name);
+
+    if (!ar) {
+        ALOGE("invalid audio_route");
+        return -1;
+    }
+
+    path = path_get_by_name(ar, name);
+    if (!path) {
+        ALOGE("unable to find path '%s'", name);
+        return -1;
+    }
+
+    path_apply_value(ar, path, value);
+
+    return 0;
+}
+
+int audio_route_missing_ctl(struct audio_route *ar)
+{
+    if (!ar) {
+        ALOGE("invalid audio_route");
+        return 0;
+    }
+
+    return ar->missing;
+}
+#endif
 
 struct audio_route *audio_route_init(unsigned int card, const char *xml_path)
 {
@@ -1038,6 +1690,9 @@ struct audio_route *audio_route_init(unsigned int card, const char *xml_path)
        mixer to the original values */
     audio_route_update_mixer(ar);
     save_mixer_state(ar);
+#ifdef __ANDROID_VNDK_SEC__
+    mixer_path_index_init(ar);
+#endif
 
     XML_ParserFree(parser);
     fclose(file);
@@ -1061,8 +1716,23 @@ err_calloc:
 
 void audio_route_free(struct audio_route *ar)
 {
+#ifdef __ANDROID_VNDK_SEC__
+    mixer_path_index_free(ar);
+    free_path_lists(ar);
+#endif
     free_mixer_state(ar);
     mixer_close(ar->mixer);
     path_free(ar);
     free(ar);
 }
+
+#ifdef __ANDROID_VNDK_SEC__
+/* Get pcm-dai information */
+int get_dai_link(struct audio_route *ar, enum pcm_dai_link dai_link)
+{
+    if (ar)
+        ALOGV("requested PCM for %d", dai_link);
+
+    return -1;
+}
+#endif

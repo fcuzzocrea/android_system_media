@@ -1415,6 +1415,13 @@ static inline bool audio_is_ble_unicast_device(audio_devices_t device)
             AUDIO_DEVICE_OUT_BLE_UNICAST_CNT, device);
 }
 
+static inline bool audio_is_ble_broadcast_device(audio_devices_t device)
+{
+    return audio_binary_search_device_array(
+            AUDIO_DEVICE_OUT_BLE_BROADCAST_ARRAY, 0 /*left*/,
+            AUDIO_DEVICE_OUT_BLE_BROADCAST_CNT, device);
+}
+
 static inline bool audio_is_ble_in_device(audio_devices_t device)
 {
     return audio_binary_search_device_array(
@@ -2174,12 +2181,15 @@ __END_DECLS
 
 #define AUDIO_HARDWARE_MODULE_ID_PRIMARY "primary"
 #define AUDIO_HARDWARE_MODULE_ID_A2DP "a2dp"
+#define AUDIO_HARDWARE_MODULE_ID_BLUETOOTH "bluetooth"
 #define AUDIO_HARDWARE_MODULE_ID_USB "usb"
 #define AUDIO_HARDWARE_MODULE_ID_REMOTE_SUBMIX "r_submix"
 #define AUDIO_HARDWARE_MODULE_ID_CODEC_OFFLOAD "codec_offload"
 #define AUDIO_HARDWARE_MODULE_ID_STUB "stub"
 #define AUDIO_HARDWARE_MODULE_ID_HEARING_AID "hearing_aid"
 #define AUDIO_HARDWARE_MODULE_ID_MSD "msd"
+
+#define AUDIO_PROFILE_NAME_BT_A2DP_PLAYBACK "a2dp output"  // Profile name for a2dp
 
 /**
  * Multi-Stream Decoder (MSD) HAL service name. MSD HAL is used to mix

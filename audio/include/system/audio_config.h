@@ -63,8 +63,8 @@ static inline std::string audio_find_readable_configuration_file(const char* fil
  */
 static inline std::string audio_get_audio_policy_config_file() {
     static constexpr const char *apmXmlConfigFileName = "audio_policy_configuration.xml";
-    static constexpr const char *apmA2dpOffloadDisabledXmlConfigFileName =
-            "audio_policy_configuration_a2dp_offload_disabled.xml";
+    //static constexpr const char *apmA2dpOffloadDisabledXmlConfigFileName =
+    //        "audio_policy_configuration_a2dp_offload_disabled.xml";
     static constexpr const char *apmLeOffloadDisabledXmlConfigFileName =
             "audio_policy_configuration_le_offload_disabled.xml";
     static constexpr const char *apmBluetoothLegacyHalXmlConfigFileName =
@@ -79,11 +79,12 @@ static inline std::string audio_get_audio_policy_config_file() {
             // the legacy hardware module for A2DP and hearing aid.
             audioPolicyXmlConfigFile = audio_find_readable_configuration_file(
                     apmBluetoothLegacyHalXmlConfigFileName);
-        } else if (property_get_bool("persist.bluetooth.a2dp_offload.disabled", false)) {
+
+        //} else if (property_get_bool("persist.bluetooth.a2dp_offload.disabled", false)) {
             // A2DP offload supported but disabled: try to use special XML file
             // assume that if a2dp offload is not supported, le offload is not supported as well
-            audioPolicyXmlConfigFile = audio_find_readable_configuration_file(
-                    apmA2dpOffloadDisabledXmlConfigFileName);
+        //    audioPolicyXmlConfigFile = audio_find_readable_configuration_file(
+        //            apmA2dpOffloadDisabledXmlConfigFileName);
         } else if (!property_get_bool("ro.bluetooth.leaudio_offload.supported", false) ||
             property_get_bool("persist.bluetooth.leaudio_offload.disabled", false)) {
             // A2DP offload supported but LE offload disabled: try to use special XML file

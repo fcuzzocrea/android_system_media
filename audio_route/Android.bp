@@ -25,6 +25,29 @@ cc_defaults {
 }
 
 cc_library_shared {
+    name: "libaudioroute_sec",
+    vendor: true,
+    vndk: {
+        enabled: true,
+        extends: "libaudioroute",
+    },
+    srcs: ["audio_route.c"],
+    shared_libs: [
+        "liblog",
+        "libcutils",
+        "libutils",
+        "libexpat",
+        "libtinyalsa_sec",
+    ],
+    cflags: [
+        "-Werror",
+        "-Wall",
+        "-D__ANDROID_VNDK_SEC__",
+    ],
+    export_include_dirs: ["include"]
+}
+
+cc_library_shared {
     name: "libaudioroute",
     defaults: ["libaudioroute_defaults"],
     vndk: {

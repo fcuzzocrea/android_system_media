@@ -276,6 +276,18 @@ int proxy_read(alsa_device_proxy * proxy, void *data, unsigned int count)
     return ret;
 }
 
+#ifdef __ANDROID_VNDK_SEC__
+int proxy_start(const alsa_device_proxy * proxy)
+{
+    return pcm_start(proxy->pcm);
+}
+
+int proxy_stop(const alsa_device_proxy * proxy)
+{
+    return pcm_stop(proxy->pcm);
+}
+#endif
+
 /*
  * Debugging
  */
